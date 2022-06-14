@@ -16,10 +16,6 @@ trait ReadVarExt: byteorder::ReadBytesExt {
             res = (res << 7) | (val & 0x7F);
             len += 1;
 
-            if len > 9 {
-                return Err(Error::new(ErrorKind::InvalidData, "VarInt is too long"));
-            }
-
             if val & 0b10000000 == 0 {
                 return Ok(res as i64);
             }
@@ -127,7 +123,7 @@ impl FilePage {
     fn read<R>(reader: &mut R, file_header: &FileHeader) -> std::io::Result<Self>
         where R: Read + Seek
     {
-        let start = reader.stream_position()?;
+        let start = reader.stream_position()? & !(file_header.page_size as u64 - 1);
         let header = FilePageHeader::read(reader)?;
 
         let mut cell_offsets = Vec::new();
