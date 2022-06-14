@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Error, ErrorKind, Read, Seek, SeekFrom};
 
@@ -7,16 +8,14 @@ use crate::FilePageType::{IndexInterior, IndexLeaf, TableInterior, TableLeaf};
 
 trait ReadVarExt: byteorder::ReadBytesExt {
     fn read_var64(&mut self) -> std::io::Result<i64> {
-        let mut len = 0u64;
         let mut res = 0u64;
 
         loop {
             let val = self.read_u8()? as u64;
 
             res = (res << 7) | (val & 0x7F);
-            len += 1;
 
-            if val & 0b10000000 == 0 {
+            if val & 0x80 == 0 {
                 return Ok(res as i64);
             }
         }
@@ -55,7 +54,7 @@ impl FileHeader {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialOrd, PartialEq)]
 enum FilePageType {
     TableInterior,
     TableLeaf,
@@ -196,13 +195,8 @@ impl FilePageCell {
 #[derive(Debug)]
 enum RecordEntry {
     Null,
-    Int8(i8),
-    Int16(i16),
-    Int24(i32),
-    Int32(i32),
-    Int48(i64),
-    Int64(i64),
-    Float64(f64),
+    Integer(i64),
+    Float(f64),
     Blob(Vec<u8>),
     Text(String),
 }
@@ -230,15 +224,15 @@ impl Record {
         for typ in entry_types.iter() {
             entries.push(match *typ {
                 0 => RecordEntry::Null,
-                1 => RecordEntry::Int8(reader.read_i8()?),
-                2 => RecordEntry::Int16(reader.read_i16::<BigEndian>()?),
-                3 => RecordEntry::Int24(reader.read_i24::<BigEndian>()?),
-                4 => RecordEntry::Int32(reader.read_i32::<BigEndian>()?),
-                5 => RecordEntry::Int48(reader.read_i48::<BigEndian>()?),
-                6 => RecordEntry::Int64(reader.read_i64::<BigEndian>()?),
-                7 => RecordEntry::Float64(reader.read_f64::<BigEndian>()?),
-                8 => RecordEntry::Int8(0),
-                9 => RecordEntry::Int8(1),
+                1 => RecordEntry::Integer(reader.read_i8()? as i64),
+                2 => RecordEntry::Integer(reader.read_i16::<BigEndian>()? as i64),
+                3 => RecordEntry::Integer(reader.read_i24::<BigEndian>()? as i64),
+                4 => RecordEntry::Integer(reader.read_i32::<BigEndian>()? as i64),
+                5 => RecordEntry::Integer(reader.read_i48::<BigEndian>()? as i64),
+                6 => RecordEntry::Integer(reader.read_i64::<BigEndian>()?),
+                7 => RecordEntry::Float(reader.read_f64::<BigEndian>()?),
+                8 => RecordEntry::Integer(0),
+                9 => RecordEntry::Integer(1),
                 x if x >= 12 && x % 2 == 0 => {
                     let mut buf = vec![0; ((x - 12) / 2) as usize];
                     reader.read_exact(&mut buf)?;
@@ -260,25 +254,91 @@ impl Record {
     }
 }
 
+struct Filter {
+    min_rowid: Option<i64>,
+    max_rowid: Option<i64>,
+}
+
+impl Filter {
+    fn matches(&self, cell: &FilePageCell) -> bool {
+        let mut result = true;
+
+        result &= match self.min_rowid {
+            Some(min_rowid) => cell.rowid.map(|rowid| rowid >= min_rowid).unwrap_or(false),
+            None => true,
+        };
+
+        result &= match self.max_rowid {
+            Some(max_rowid) => cell.rowid.map(|rowid| rowid <= max_rowid).unwrap_or(false),
+            None => true,
+        };
+
+        result
+    }
+}
+
+fn print_page_contents(pages: &HashMap<u32, FilePage>, page: &FilePage, filter: &Filter) {
+    match &page.header.typ {
+        TableInterior => {
+            for cell in page.cells.iter().filter(|cell| filter.matches(cell)) {
+                let left_child_page_number = cell.left_child_page_number.unwrap();
+                let left_child_page = pages.get(&left_child_page_number).unwrap();
+                print_page_contents(pages, left_child_page, filter);
+            }
+            print_page_contents(pages, pages.get(&page.header.right_most_pointer.unwrap()).unwrap(), filter);
+        }
+        TableLeaf => {
+            for cell in page.cells.iter().filter(|cell| filter.matches(cell)) {
+                let rowid = cell.rowid.unwrap();
+                let record = cell.payload.as_ref().unwrap();
+                println!("[{:?}]: {:?}", rowid, record.entries);
+            }
+        }
+        IndexInterior => {
+            for cell in page.cells.iter().filter(|cell| filter.matches(cell)) {
+                let left_child_page_number = cell.left_child_page_number.unwrap();
+                let left_child_page = pages.get(&left_child_page_number).unwrap();
+                print_page_contents(pages, left_child_page, filter);
+
+                let record = cell.payload.as_ref().unwrap();
+                println!("{:?} => {:?}", record.entries[0], record.entries[1]);
+            }
+        }
+        IndexLeaf => {
+            for cell in page.cells.iter().filter(|cell| filter.matches(cell)) {
+                let record = cell.payload.as_ref().unwrap();
+                println!("{:?} => {:?}", record.entries[0], record.entries[1]);
+            }
+        }
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let mut file = std::env::args().nth(1)
         .map(File::open)
         .unwrap_or_else(|| Err(Error::new(ErrorKind::InvalidInput, "No input parameter specified")))?;
 
     let file_header = FileHeader::read(&mut file)?;
-    let mut file_pages = Vec::new();
+    let mut file_pages = HashMap::new();
 
     for page_index in 1..=file_header.database_size {
         match FilePage::read(&mut file, &file_header) {
             Ok(page) => {
-                println!("{}: {:#?}", page_index, page);
-                file_pages.push(page);
+                // println!("{}: {:#?}", page_index, page);
+                file_pages.insert(page_index, page);
             }
             Err(err) => println!("{}", err)
         };
 
         file.seek(SeekFrom::Start(file_header.page_size as u64 * page_index as u64))?;
     }
+
+    let filter = Filter {
+        min_rowid: None, // Some(300),
+        max_rowid: None, // Some(320),
+    };
+
+    print_page_contents(&file_pages, file_pages.get(&0).unwrap(), &filter);
 
     Ok(())
 }
